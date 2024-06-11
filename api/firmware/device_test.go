@@ -1,4 +1,5 @@
 // Copyright 2018-2019 Shift Cryptosecurity AG
+// Copyright 2024 Shift Crypto AG
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,18 +17,95 @@ package firmware
 
 import (
 	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/BitBoxSwiss/bitbox02-api-go/api/common"
 	"github.com/BitBoxSwiss/bitbox02-api-go/api/firmware/messages"
 	"github.com/BitBoxSwiss/bitbox02-api-go/api/firmware/mocks"
+	"github.com/BitBoxSwiss/bitbox02-api-go/communication/u2fhid"
 	"github.com/BitBoxSwiss/bitbox02-api-go/util/semver"
 	"github.com/flynn/noise"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 )
+
+func runSimulator() (func() error, *Device, error) {
+	cmd := exec.Command("./testdata/simulator")
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+	var conn net.Conn
+	var err error
+	for i := 0; i < 200; i++ {
+		conn, err = net.Dial("tcp", "localhost:15423")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	const bitboxCMD = 0x80 + 0x40 + 0x01
+
+	communication := u2fhid.NewCommunication(conn, bitboxCMD)
+	device := NewDevice(nil, nil,
+		&mocks.Config{}, communication, &mocks.Logger{},
+	)
+	return func() error {
+		if err := conn.Close(); err != nil {
+			return err
+		}
+		return cmd.Process.Kill()
+	}, device, nil
+}
+
+// Runs tests against a simulator which is not initialized (not paired, not seeded).
+func testSimulators(t *testing.T, run func(*testing.T, *Device)) {
+	t.Helper()
+	teardown, device, err := runSimulator()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, teardown()) }()
+	run(t, device)
+}
+
+// Runs tests against a simulator which is not initialized, but paired (not seeded).
+func testSimulatorsAfterPairing(t *testing.T, run func(*testing.T, *Device)) {
+	t.Helper()
+	testSimulators(t, func(t *testing.T, device *Device) {
+		t.Helper()
+		require.NoError(t, device.Init())
+		device.ChannelHashVerify(true)
+		run(t, device)
+	})
+}
+
+// Runs tests againt a simulator that is seeded with this mnemonic: boring mistake dish oyster truth
+// pigeon viable emerge sort crash wire portion cannon couple enact box walk height pull today solid
+// off enable tide
+func testInitializedSimulators(t *testing.T, run func(*testing.T, *Device)) {
+	t.Helper()
+	testSimulatorsAfterPairing(t, func(t *testing.T, device *Device) {
+		t.Helper()
+		require.NoError(t, device.RestoreFromMnemonic())
+		run(t, device)
+	})
+}
+
+func TestSimulatorRootFingerprint(t *testing.T) {
+	testInitializedSimulators(t, func(t *testing.T, device *Device) {
+		t.Helper()
+		fp, err := device.RootFingerprint()
+		require.NoError(t, err)
+		require.Equal(t, "4c00739d", hex.EncodeToString(fp))
+	})
+}
 
 // newDevice creates a device to test with, with init/pairing already processed.
 func newDevice(
@@ -293,6 +371,14 @@ func TestVersion(t *testing.T) {
 	testConfigurations(t, func(t *testing.T, env *testEnv) {
 		t.Helper()
 		require.Equal(t, env.version, env.device.Version())
+	})
+}
+
+func TestSimulatorProduct(t *testing.T) {
+	testSimulators(t, func(t *testing.T, device *Device) {
+		t.Helper()
+		require.NoError(t, device.Init())
+		require.Equal(t, common.ProductBitBox02Multi, device.Product())
 	})
 }
 
