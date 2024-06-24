@@ -145,24 +145,24 @@ func NewDevice(
 
 // info uses the opInfo api endpoint to learn about the version, platform/edition, and unlock
 // status (true if unlocked).
-func (device *Device) info() (*semver.SemVer, common.Product, bool, error) {
+func (device *Device) info() (*semver.SemVer, common.Product, bool, *bool, error) {
 
 	// CAREFUL: hwwInfo is called on the raw transport, not on device.rawQuery, which behaves
 	// differently depending on the firmware version. Reason: the version is not
 	// available (this call is used to get the version), so it must work for all firmware versions.
 	response, err := device.communication.Query([]byte(hwwInfo))
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, nil, err
 	}
 
 	if len(response) < 4 {
-		return nil, "", false, errp.New("unexpected response")
+		return nil, "", false, nil, errp.New("unexpected response")
 	}
 	versionStrLen, response := int(response[0]), response[1:]
 	versionBytes, response := response[:versionStrLen], response[versionStrLen:]
 	version, err := semver.NewSemVerFromString(string(versionBytes))
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", false, nil, err
 	}
 	platformByte, response := response[0], response[1:]
 	editionByte, response := response[0], response[1:]
@@ -175,24 +175,41 @@ func (device *Device) info() (*semver.SemVer, common.Product, bool, error) {
 	}
 	editions, ok := products[platformByte]
 	if !ok {
-		return nil, "", false, errp.Newf("unrecognized platform: %v", platformByte)
+		return nil, "", false, nil, errp.Newf("unrecognized platform: %v", platformByte)
 	}
 	product, ok := editions[editionByte]
 	if !ok {
-		return nil, "", false, errp.Newf("unrecognized platform/edition: %v/%v", platformByte, editionByte)
+		return nil, "", false, nil, errp.Newf("unrecognized platform/edition: %v/%v", platformByte, editionByte)
 	}
 
 	var unlocked bool
-	unlockedByte := response[0]
+	unlockedByte, response := response[0], response[1:]
 	switch unlockedByte {
 	case 0x00:
 		unlocked = false
 	case 0x01:
 		unlocked = true
 	default:
-		return nil, "", false, errp.New("unexpected reply")
+		return nil, "", false, nil, errp.New("unexpected reply")
 	}
-	return version, product, unlocked, nil
+
+	// Before 9.20.0 REQ_INFO does not respond with a byte for the initialized status.
+	if !version.AtLeast(semver.NewSemVer(9, 20, 0)) {
+		return version, product, unlocked, nil, nil
+	}
+
+	var initialized bool
+	initializedByte := response[0]
+	switch initializedByte {
+	case 0x00:
+		initialized = false
+	case 0x01:
+		initialized = true
+	default:
+		return nil, "", false, nil, errp.New("unexpected reply")
+	}
+
+	return version, product, unlocked, &initialized, nil
 }
 
 // Version returns the firmware version.
@@ -206,14 +223,9 @@ func (device *Device) Version() *semver.SemVer {
 // inferVersionAndProduct either sets the version and product by using OP_INFO if they were not
 // provided. In this case, the firmware is assumed to be >=v4.3.0, before that OP_INFO was not
 // available.
-func (device *Device) inferVersionAndProduct() error {
+func (device *Device) inferVersionAndProduct(version *semver.SemVer, product common.Product) error {
 	// The version has not been provided, so we try to get it from OP_INFO.
 	if device.version == nil {
-		version, product, _, err := device.info()
-		if err != nil {
-			return errp.New(
-				"OP_INFO unavailable; need to provide version and product via the USB HID descriptor")
-		}
 		device.log.Info(fmt.Sprintf("OP_INFO: version=%s, product=%s", version, product))
 
 		// sanity check
@@ -241,11 +253,25 @@ func (device *Device) Init() error {
 	device.channelHashDeviceVerified = false
 	device.sendCipher = nil
 	device.receiveCipher = nil
-	device.changeStatus(StatusConnected)
 
-	if err := device.inferVersionAndProduct(); err != nil {
-		return err
+	version, product, unlocked, initialized, err := device.info()
+	if err != nil {
+		return errp.New(
+			"OP_INFO unavailable; need to provide version and product via the USB HID descriptor")
 	}
+	// The semantics of the firmware and status.Status are not the same.
+	// status.Status StatusInitialized means the device is unlocked.
+	// The firmware initialized = true means the device can be unlocked.
+	if unlocked {
+		device.changeStatus(StatusInitialized)
+	} else if initialized {
+		device.changeStatus(StatusConnected)
+	} else {
+		device.changeStatus(StatusUninitialized)
+	}
+
+	device.inferVersionAndProduct(version, product)
+
 	if device.version.AtLeast(lowestNonSupportedFirmwareVersion) {
 		device.changeStatus(StatusRequireAppUpgrade)
 		return nil
@@ -261,7 +287,7 @@ func (device *Device) Init() error {
 
 	// Before 2.0.0, unlock was invoked automatically by the device before USB communication
 	// started.
-	if device.version.AtLeast(semver.NewSemVer(2, 0, 0)) {
+	if device.version.AtLeast(semver.NewSemVer(2, 0, 0)) && (device.status != StatusInitialized) {
 		_, err := device.rawQuery([]byte(opUnlock))
 		if err != nil {
 			// Most likely the device has been unplugged.
